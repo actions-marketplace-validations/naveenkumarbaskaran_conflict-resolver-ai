@@ -1,0 +1,181 @@
+name: "Conflict Resolver AI — LLM-Powered Merge Conflict Resolution"
+description: "AI that understands both sides of merge conflicts, proposes resolutions, and optionally auto-resolves."
+author: "Naveen Kumar Baskaran"
+
+branding:
+  icon: "git-merge"
+  color: "green"
+
+inputs:
+  api_key:
+    description: "API key for the LLM provider (OpenAI, Anthropic, etc.)"
+    required: true
+  model:
+    description: "LLM model to use"
+    required: false
+    default: "gpt-4o-mini"
+  mode:
+    description: "suggest (post suggestions) or auto-resolve (commit fixes)"
+    required: false
+    default: "suggest"
+  target_branch:
+    description: "Branch to merge into (default: PR base branch)"
+    required: false
+    default: ""
+  max_conflicts:
+    description: "Maximum number of conflicts to resolve (0 = no limit)"
+    required: false
+    default: "20"
+  confidence_threshold:
+    description: "Min confidence (0-100) for auto-resolve. Below this, suggest only."
+    required: false
+    default: "85"
+  extra_context:
+    description: "Additional context about the codebase or conflict resolution preferences"
+    required: false
+    default: ""
+  post_comment:
+    description: "Post resolution suggestions as a PR comment"
+    required: false
+    default: "true"
+  commit_message:
+    description: "Commit message template for auto-resolved conflicts"
+    required: false
+    default: "fix: auto-resolve merge conflicts via Conflict Resolver AI"
+  github_token:
+    description: "GitHub token"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  conflicts_found:
+    description: "Number of merge conflicts found"
+    value: ${{ steps.resolve.outputs.conflicts_found }}
+  conflicts_resolved:
+    description: "Number of conflicts resolved (auto-resolve mode)"
+    value: ${{ steps.resolve.outputs.conflicts_resolved }}
+  confidence_avg:
+    description: "Average resolution confidence (0-100)"
+    value: ${{ steps.resolve.outputs.confidence_avg }}
+  result_json:
+    description: "Full results as JSON"
+    value: ${{ steps.resolve.outputs.result_json }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install --quiet litellm
+
+    - name: Detect conflicts
+      shell: bash
+      id: detect
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+        REPO="${{ github.repository }}"
+        TARGET="${{ inputs.target_branch }}"
+
+        if [ -z "$TARGET" ]; then
+          TARGET=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.ref')
+        fi
+
+        echo "target_branch=$TARGET" >> $GITHUB_OUTPUT
+        echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+
+        # Try merge to detect conflicts
+        git config user.email "action@github.com"
+        git config user.name "Conflict Resolver AI"
+
+        git fetch origin "$TARGET" 2>/dev/null || true
+        MERGE_RESULT=$(git merge "origin/$TARGET" --no-commit --no-ff 2>&1) || true
+
+        if echo "$MERGE_RESULT" | grep -q "CONFLICT"; then
+          echo "has_conflicts=true" >> $GITHUB_OUTPUT
+          # Get list of conflicted files
+          git diff --name-only --diff-filter=U > /tmp/conflict_files.txt
+          CONFLICT_COUNT=$(wc -l < /tmp/conflict_files.txt | tr -d ' ')
+          echo "conflict_count=$CONFLICT_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $CONFLICT_COUNT conflicted files"
+
+          # Save conflict content for each file
+          mkdir -p /tmp/conflicts
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              cp "$file" "/tmp/conflicts/$(echo "$file" | tr '/' '_')"
+            fi
+          done < /tmp/conflict_files.txt
+        else
+          echo "has_conflicts=false" >> $GITHUB_OUTPUT
+          echo "conflict_count=0" >> $GITHUB_OUTPUT
+          echo "No conflicts detected"
+        fi
+
+        # Abort the merge attempt
+        git merge --abort 2>/dev/null || git reset --hard HEAD 2>/dev/null || true
+
+    - name: Resolve conflicts
+      shell: bash
+      if: steps.detect.outputs.has_conflicts == 'true'
+      id: resolve
+      env:
+        LLM_API_KEY: ${{ inputs.api_key }}
+        LLM_MODEL: ${{ inputs.model }}
+        MODE: ${{ inputs.mode }}
+        MAX_CONFLICTS: ${{ inputs.max_conflicts }}
+        CONFIDENCE_THRESHOLD: ${{ inputs.confidence_threshold }}
+        EXTRA_CONTEXT: ${{ inputs.extra_context }}
+      run: |
+        python3 "${{ github.action_path }}/resolve.py" \
+          --conflict-files /tmp/conflict_files.txt \
+          --conflict-dir /tmp/conflicts \
+          --output /tmp/resolution_result.json
+
+    - name: No conflicts found
+      shell: bash
+      if: steps.detect.outputs.has_conflicts != 'true'
+      id: no_conflicts
+      run: |
+        echo "conflicts_found=0" >> $GITHUB_OUTPUT
+        echo "conflicts_resolved=0" >> $GITHUB_OUTPUT
+        echo "confidence_avg=100" >> $GITHUB_OUTPUT
+        echo 'result_json={"conflicts":[],"resolved":0}' >> $GITHUB_OUTPUT
+        echo "✅ No merge conflicts detected"
+
+    - name: Apply auto-resolutions
+      shell: bash
+      if: steps.detect.outputs.has_conflicts == 'true' && inputs.mode == 'auto-resolve'
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        COMMIT_MSG: ${{ inputs.commit_message }}
+      run: |
+        python3 "${{ github.action_path }}/apply_resolutions.py" \
+          --result /tmp/resolution_result.json \
+          --commit-message "$COMMIT_MSG"
+
+    - name: Post comment
+      shell: bash
+      if: steps.detect.outputs.has_conflicts == 'true' && inputs.post_comment == 'true'
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        python3 "${{ github.action_path }}/post_comment.py" \
+          --result /tmp/resolution_result.json \
+          --repo "${{ github.repository }}" \
+          --pr "${{ github.event.pull_request.number }}" \
+          --mode "${{ inputs.mode }}"
+
+    - name: Write Job Summary
+      shell: bash
+      if: steps.detect.outputs.has_conflicts == 'true'
+      run: |
+        python3 "${{ github.action_path }}/job_summary.py" \
+          --result /tmp/resolution_result.json \
+          --mode "${{ inputs.mode }}"
